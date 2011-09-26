@@ -57,8 +57,8 @@ messages() -> {ssl, ssl_closed, ssl_error}.
 %% @see ssl:listen/2
 %% @todo The password option shouldn't be mandatory.
 -spec listen([{port, inet:ip_port()} | {certfile, string()}
-	| {keyfile, string()} | {password, string()}
-	| {ip, inet:ip_address()}])
+  | {keyfile, string()} | {password, string()}
+  | {cacertfile, string()} | {ip, inet:ip_address()}])
 	-> {ok, ssl:sslsocket()} | {error, atom()}.
 listen(Opts) ->
 	require([crypto, public_key, ssl]),
@@ -70,10 +70,15 @@ listen(Opts) ->
 	ListenOpts0 = [binary, {active, false},
 		{backlog, Backlog}, {packet, raw}, {reuseaddr, true},
 		{certfile, CertFile}, {keyfile, KeyFile}, {password, Password}],
-	ListenOpts =
+	ListenOpts1 =
 		case lists:keyfind(ip, 1, Opts) of
 			false -> ListenOpts0;
 			Ip -> [Ip|ListenOpts0]
+		end,
+  ListenOpts =
+		case lists:keyfind(cacertfile, 1, Opts) of
+			false -> ListenOpts1;
+			CACertFile -> [CACertFile|ListenOpts1]
 		end,
 	ssl:listen(Port, ListenOpts).
 
