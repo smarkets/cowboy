@@ -19,19 +19,22 @@
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
 	init_per_group/2, end_per_group/2]). %% ct.
 -export([chunked_response/1, headers_dupe/1, headers_huge/1,
-	nc_rand/1, pipeline/1, raw/1, ws0/1, ws8/1]). %% http.
+	keepalive_nl/1, nc_rand/1, pipeline/1, raw/1,
+	ws0/1, ws8/1, ws_timeout_hibernate/1]). %% http.
 -export([http_200/1, http_404/1]). %% http and https.
+-export([http_10_hostless/1]). %% misc.
 
 %% ct.
 
 all() ->
-	[{group, http}, {group, https}].
+	[{group, http}, {group, https}, {group, misc}].
 
 groups() ->
 	BaseTests = [http_200, http_404],
 	[{http, [], [chunked_response, headers_dupe, headers_huge,
-		nc_rand, pipeline, raw, ws0, ws8] ++ BaseTests},
-	{https, [], BaseTests}].
+		keepalive_nl, nc_rand, pipeline, raw,
+		ws0, ws8, ws_timeout_hibernate] ++ BaseTests},
+	{https, [], BaseTests}, {misc, [], [http_10_hostless]}].
 
 init_per_suite(Config) ->
 	application:start(inets),
@@ -62,16 +65,24 @@ init_per_group(https, Config) ->
 			{keyfile, DataDir ++ "key.pem"}, {password, "cowboy"}],
 		cowboy_http_protocol, [{dispatch, init_https_dispatch()}]
 	),
-	[{scheme, "https"}, {port, Port}|Config].
+	[{scheme, "https"}, {port, Port}|Config];
+init_per_group(misc, Config) ->
+	Port = 33082,
+	cowboy:start_listener(misc, 100,
+		cowboy_tcp_transport, [{port, Port}],
+		cowboy_http_protocol, [{dispatch, [{'_', [
+			{[], http_handler, []}
+	]}]}]),
+	[{port, Port}|Config].
 
-end_per_group(http, _Config) ->
-	cowboy:stop_listener(http),
-	ok;
 end_per_group(https, _Config) ->
 	cowboy:stop_listener(https),
 	application:stop(ssl),
 	application:stop(public_key),
 	application:stop(crypto),
+	ok;
+end_per_group(Listener, _Config) ->
+	cowboy:stop_listener(Listener),
 	ok.
 
 %% Dispatch configuration.
@@ -81,6 +92,7 @@ init_http_dispatch() ->
 		{[<<"localhost">>], [
 			{[<<"chunked_response">>], chunked_handler, []},
 			{[<<"websocket">>], websocket_handler, []},
+			{[<<"ws_timeout_hibernate">>], ws_timeout_hibernate_handler, []},
 			{[<<"headers">>, <<"dupe">>], http_handler,
 				[{headers, [{<<"Connection">>, <<"close">>}]}]},
 			{[], http_handler, []}
@@ -112,6 +124,24 @@ headers_huge(Config) ->
 		"Wed Apr 06 2011 10:38:52 GMT-0500 (CDT)" || _N <- lists:seq(1, 1000)]),
 	{_Packet, 200} = raw_req(["GET / HTTP/1.0\r\nHost: localhost\r\n"
 		"Set-Cookie: ", Cookie, "\r\n\r\n"], Config).
+
+keepalive_nl(Config) ->
+	{port, Port} = lists:keyfind(port, 1, Config),
+	{ok, Socket} = gen_tcp:connect("localhost", Port,
+		[binary, {active, false}, {packet, raw}]),
+	ok = keepalive_nl_loop(Socket, 100),
+	ok = gen_tcp:close(Socket).
+
+keepalive_nl_loop(_Socket, 0) ->
+	ok;
+keepalive_nl_loop(Socket, N) ->
+	ok = gen_tcp:send(Socket, "GET / HTTP/1.1\r\n"
+		"Host: localhost\r\nConnection: keep-alive\r\n\r\n"),
+	{ok, Data} = gen_tcp:recv(Socket, 0, 6000),
+	{0, 12} = binary:match(Data, <<"HTTP/1.1 200">>),
+	nomatch = binary:match(Data, <<"Connection: close">>),
+	ok = gen_tcp:send(Socket, "\r\n"), %% extra nl
+	keepalive_nl_loop(Socket, N - 1).
 
 nc_rand(Config) ->
 	Cat = os:find_executable("cat"),
@@ -270,6 +300,32 @@ ws8(Config) ->
 	{error, closed} = gen_tcp:recv(Socket, 0, 6000),
 	ok.
 
+ws_timeout_hibernate(Config) ->
+	{port, Port} = lists:keyfind(port, 1, Config),
+	{ok, Socket} = gen_tcp:connect("localhost", Port,
+		[binary, {active, false}, {packet, raw}]),
+	ok = gen_tcp:send(Socket, [
+		"GET /ws_timeout_hibernate HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Connection: Upgrade\r\n"
+		"Upgrade: websocket\r\n"
+		"Sec-WebSocket-Origin: http://localhost\r\n"
+		"Sec-WebSocket-Version: 8\r\n"
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+		"\r\n"]),
+	{ok, Handshake} = gen_tcp:recv(Socket, 0, 6000),
+	{ok, {http_response, {1, 1}, 101, "Switching Protocols"}, Rest}
+		= erlang:decode_packet(http, Handshake, []),
+	[Headers, <<>>] = websocket_headers(
+		erlang:decode_packet(httph, Rest, []), []),
+	{'Connection', "Upgrade"} = lists:keyfind('Connection', 1, Headers),
+	{'Upgrade', "websocket"} = lists:keyfind('Upgrade', 1, Headers),
+	{"sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="}
+		= lists:keyfind("sec-websocket-accept", 1, Headers),
+	{ok, << 1:1, 0:3, 8:4, 0:8 >>} = gen_tcp:recv(Socket, 0, 6000),
+	{error, closed} = gen_tcp:recv(Socket, 0, 6000),
+	ok.
+
 websocket_headers({ok, http_eoh, Rest}, Acc) ->
 	[Acc, Rest];
 websocket_headers({ok, {http_header, _I, Key, _R, Value}, Rest}, Acc) ->
@@ -291,3 +347,9 @@ http_200(Config) ->
 http_404(Config) ->
 	{ok, {{"HTTP/1.1", 404, "Not Found"}, _Headers, _Body}} =
 		httpc:request(build_url("/not/found", Config)).
+
+%% misc.
+
+http_10_hostless(Config) ->
+	Packet = "GET / HTTP/1.0\r\n\r\n",
+	{Packet, 200} = raw_req(Packet, Config).

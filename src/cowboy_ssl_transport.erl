@@ -50,6 +50,9 @@ messages() -> {ssl, ssl_closed, ssl_error}.
 %%   certificate.</dd>
 %%  <dt>keyfile</dt><dd>Mandatory. Path to the file containing the user's
 %%   private PEM encoded key.</dd>
+%%  <dt>cacertfile</dt><dd>Optional. Path to file containing PEM encoded
+%%   CA certificates (trusted certificates used for verifying a peer
+%%   certificate).</dd>
 %%  <dt>password</dt><dd>Mandatory. String containing the user's password.
 %%   All private keyfiles must be password protected currently.</dd>
 %% </dl>
@@ -57,8 +60,8 @@ messages() -> {ssl, ssl_closed, ssl_error}.
 %% @see ssl:listen/2
 %% @todo The password option shouldn't be mandatory.
 -spec listen([{port, inet:ip_port()} | {certfile, string()}
-  | {keyfile, string()} | {password, string()}
-  | {cacertfile, string()} | {ip, inet:ip_address()}])
+	| {keyfile, string()} | {password, string()}
+	| {cacertfile, string()} | {ip, inet:ip_address()}])
 	-> {ok, ssl:sslsocket()} | {error, atom()}.
 listen(Opts) ->
 	require([crypto, public_key, ssl]),
@@ -75,7 +78,7 @@ listen(Opts) ->
 			false -> ListenOpts0;
 			Ip -> [Ip|ListenOpts0]
 		end,
-  ListenOpts =
+	ListenOpts =
 		case lists:keyfind(cacertfile, 1, Opts) of
 			false -> ListenOpts1;
 			CACertFile -> [CACertFile|ListenOpts1]

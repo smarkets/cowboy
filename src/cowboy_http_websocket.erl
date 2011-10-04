@@ -52,6 +52,7 @@
 	opts :: any(),
 	challenge = undefined :: undefined | binary(),
 	timeout = infinity :: timeout(),
+	timeout_ref = undefined :: undefined | reference(),
 	messages = undefined :: undefined | {atom(), atom(), atom()},
 	hibernate = false :: boolean(),
 	eop :: undefined | tuple(), %% hixie-76 specific.
@@ -116,9 +117,15 @@ handler_init(State=#state{handler=Handler, opts=Opts},
 	try Handler:websocket_init(Transport:name(), Req, Opts) of
 		{ok, Req2, HandlerState} ->
 			websocket_handshake(State, Req2, HandlerState);
+		{ok, Req2, HandlerState, hibernate} ->
+			websocket_handshake(State#state{hibernate=true},
+				Req2, HandlerState);
 		{ok, Req2, HandlerState, Timeout} ->
 			websocket_handshake(State#state{timeout=Timeout},
-				Req2, HandlerState)
+				Req2, HandlerState);
+		{ok, Req2, HandlerState, Timeout, hibernate} ->
+			websocket_handshake(State#state{timeout=Timeout,
+				hibernate=true}, Req2, HandlerState)
 	catch Class:Reason ->
 		upgrade_error(Req),
 		error_logger:error_msg(
@@ -137,8 +144,8 @@ upgrade_error(Req=#http_req{socket=Socket, transport=Transport}) ->
 -spec websocket_handshake(#state{}, #http_req{}, any()) -> ok.
 websocket_handshake(State=#state{version=0, origin=Origin,
 		challenge=Challenge}, Req=#http_req{transport=Transport,
-		raw_host=Host, port=Port, raw_path=Path}, HandlerState) ->
-	Location = hixie76_location(Transport:name(), Host, Port, Path),
+		raw_host=Host, port=Port, raw_path=Path, raw_qs=QS}, HandlerState) ->
+	Location = hixie76_location(Transport:name(), Host, Port, Path, QS),
 	{ok, Req2} = cowboy_http_req:reply(
 		<<"101 WebSocket Protocol Handshake">>,
 		[{<<"Connection">>, <<"Upgrade">>},
@@ -164,16 +171,28 @@ handler_before_loop(State=#state{hibernate=true},
 		Req=#http_req{socket=Socket, transport=Transport},
 		HandlerState, SoFar) ->
 	Transport:setopts(Socket, [{active, once}]),
-	erlang:hibernate(?MODULE, handler_loop, [State#state{hibernate=false},
+	State2 = handler_loop_timeout(State),
+	erlang:hibernate(?MODULE, handler_loop, [State2#state{hibernate=false},
 		Req, HandlerState, SoFar]);
 handler_before_loop(State, Req=#http_req{socket=Socket, transport=Transport},
 		HandlerState, SoFar) ->
 	Transport:setopts(Socket, [{active, once}]),
-	handler_loop(State, Req, HandlerState, SoFar).
+	State2 = handler_loop_timeout(State),
+	handler_loop(State2, Req, HandlerState, SoFar).
+
+-spec handler_loop_timeout(#state{}) -> #state{}.
+handler_loop_timeout(State=#state{timeout=infinity}) ->
+	State#state{timeout_ref=undefined};
+handler_loop_timeout(State=#state{timeout=Timeout, timeout_ref=PrevRef}) ->
+	_ = case PrevRef of undefined -> ignore; PrevRef ->
+		erlang:cancel_timer(PrevRef) end,
+	TRef = make_ref(),
+	erlang:send_after(Timeout, self(), {?MODULE, timeout, TRef}),
+	State#state{timeout_ref=TRef}.
 
 %% @private
 -spec handler_loop(#state{}, #http_req{}, any(), binary()) -> ok.
-handler_loop(State=#state{messages={OK, Closed, Error}, timeout=Timeout},
+handler_loop(State=#state{messages={OK, Closed, Error}, timeout_ref=TRef},
 		Req=#http_req{socket=Socket}, HandlerState, SoFar) ->
 	receive
 		{OK, Socket, Data} ->
@@ -183,11 +202,13 @@ handler_loop(State=#state{messages={OK, Closed, Error}, timeout=Timeout},
 			handler_terminate(State, Req, HandlerState, {error, closed});
 		{Error, Socket, Reason} ->
 			handler_terminate(State, Req, HandlerState, {error, Reason});
+		{?MODULE, timeout, TRef} ->
+			websocket_close(State, Req, HandlerState, {normal, timeout});
+		{?MODULE, timeout, OlderTRef} when is_reference(OlderTRef) ->
+			handler_loop(State, Req, HandlerState, SoFar);
 		Message ->
 			handler_call(State, Req, HandlerState,
 				SoFar, websocket_info, Message, fun handler_before_loop/4)
-	after Timeout ->
-		websocket_close(State, Req, HandlerState, {normal, timeout})
 	end.
 
 -spec websocket_data(#state{}, #http_req{}, any(), binary()) -> ok.
@@ -337,7 +358,7 @@ handler_call(State=#state{handler=Handler, opts=Opts}, Req, HandlerState,
 %% hixie-76 text frame.
 websocket_send({text, Payload}, #state{version=0},
 		#http_req{socket=Socket, transport=Transport}) ->
-	Transport:send(Socket, << 0, Payload/binary, 255 >>);
+	Transport:send(Socket, [0, Payload, 255]);
 %% Ignore all unknown frame types for compatibility with hixie 76.
 websocket_send(_Any, #state{version=0}, _Req) ->
 	ignore;
@@ -349,9 +370,9 @@ websocket_send({Type, Payload}, _State,
 		ping -> 9;
 		pong -> 10
 	end,
-	Len = hybi_payload_length(byte_size(Payload)),
-	Transport:send(Socket, << 1:1, 0:3, Opcode:4,
-		0:1, Len/bits, Payload/binary >>).
+	Len = hybi_payload_length(iolist_size(Payload)),
+	Transport:send(Socket, [<< 1:1, 0:3, Opcode:4, 0:1, Len/bits >>,
+		Payload]).
 
 -spec websocket_close(#state{}, #http_req{}, any(), {atom(), atom()}) -> ok.
 websocket_close(State=#state{version=0}, Req=#http_req{socket=Socket,
@@ -396,11 +417,14 @@ hixie76_key_to_integer(Key) ->
 	Spaces = length([C || << C >> <= Key, C =:= 32]),
 	Number div Spaces.
 
--spec hixie76_location(atom(), binary(), inet:ip_port(), binary())
+-spec hixie76_location(atom(), binary(), inet:ip_port(), binary(), binary())
 	-> binary().
-hixie76_location(Protocol, Host, Port, Path) ->
-	<< (hixie76_location_protocol(Protocol))/binary, "://", Host/binary,
-		(hixie76_location_port(ssl, Port))/binary, Path/binary >>.
+hixie76_location(Protocol, Host, Port, Path, <<>>) ->
+    << (hixie76_location_protocol(Protocol))/binary, "://", Host/binary,
+       (hixie76_location_port(ssl, Port))/binary, Path/binary>>;
+hixie76_location(Protocol, Host, Port, Path, QS) ->
+    << (hixie76_location_protocol(Protocol))/binary, "://", Host/binary,
+       (hixie76_location_port(ssl, Port))/binary, Path/binary, "?", QS/binary >>.
 
 -spec hixie76_location_protocol(atom()) -> binary().
 hixie76_location_protocol(ssl) -> <<"wss">>;
@@ -408,9 +432,9 @@ hixie76_location_protocol(_)   -> <<"ws">>.
 
 -spec hixie76_location_port(atom(), inet:ip_port()) -> binary().
 hixie76_location_port(ssl, 443) ->
-	<<"">>;
+	<<>>;
 hixie76_location_port(_, 80) ->
-	<<"">>;
+	<<>>;
 hixie76_location_port(_, Port) ->
 	<<":", (list_to_binary(integer_to_list(Port)))/binary>>.
 
@@ -436,13 +460,17 @@ hybi_payload_length(N) ->
 
 hixie76_location_test() ->
 	?assertEqual(<<"ws://localhost/path">>,
-		hixie76_location(other, <<"localhost">>, 80, <<"/path">>)),
+		hixie76_location(other, <<"localhost">>, 80, <<"/path">>, <<>>)),
 	?assertEqual(<<"ws://localhost:8080/path">>,
-		hixie76_location(other, <<"localhost">>, 8080, <<"/path">>)),
+		hixie76_location(other, <<"localhost">>, 8080, <<"/path">>, <<>>)),
+	?assertEqual(<<"ws://localhost:8080/path?dummy=2785">>,
+		hixie76_location(other, <<"localhost">>, 8080, <<"/path">>, <<"dummy=2785">>)),
 	?assertEqual(<<"wss://localhost/path">>,
-		hixie76_location(ssl, <<"localhost">>, 443, <<"/path">>)),
+		hixie76_location(ssl, <<"localhost">>, 443, <<"/path">>, <<>>)),
 	?assertEqual(<<"wss://localhost:8443/path">>,
-		hixie76_location(ssl, <<"localhost">>, 8443, <<"/path">>)),
+		hixie76_location(ssl, <<"localhost">>, 8443, <<"/path">>, <<>>)),
+	?assertEqual(<<"wss://localhost:8443/path?dummy=2785">>,
+		hixie76_location(ssl, <<"localhost">>, 8443, <<"/path">>, <<"dummy=2785">>)),
 	ok.
 
 -endif.

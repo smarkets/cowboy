@@ -67,14 +67,14 @@ peer(Req) ->
 	{Req#http_req.peer, Req}.
 
 %% @doc Return the tokens for the hostname requested.
--spec host(#http_req{}) -> {cowboy_dispatcher:path_tokens(), #http_req{}}.
+-spec host(#http_req{}) -> {cowboy_dispatcher:tokens(), #http_req{}}.
 host(Req) ->
 	{Req#http_req.host, Req}.
 
 %% @doc Return the extra host information obtained from partially matching
 %% the hostname using <em>'...'</em>.
 -spec host_info(#http_req{})
-	-> {cowboy_dispatcher:path_tokens() | undefined, #http_req{}}.
+	-> {cowboy_dispatcher:tokens() | undefined, #http_req{}}.
 host_info(Req) ->
 	{Req#http_req.host_info, Req}.
 
@@ -88,15 +88,19 @@ raw_host(Req) ->
 port(Req) ->
 	{Req#http_req.port, Req}.
 
-%% @doc Return the tokens for the path requested.
--spec path(#http_req{}) -> {cowboy_dispatcher:path_tokens(), #http_req{}}.
+%% @doc Return the path segments for the path requested.
+%%
+%% Following RFC2396, this function may return path segments containing any
+%% character, including <em>/</em> if, and only if, a <em>/</em> was escaped
+%% and part of a path segment in the path requested.
+-spec path(#http_req{}) -> {cowboy_dispatcher:tokens(), #http_req{}}.
 path(Req) ->
 	{Req#http_req.path, Req}.
 
 %% @doc Return the extra path information obtained from partially matching
 %% the patch using <em>'...'</em>.
 -spec path_info(#http_req{})
-	-> {cowboy_dispatcher:path_tokens() | undefined, #http_req{}}.
+	-> {cowboy_dispatcher:tokens() | undefined, #http_req{}}.
 path_info(Req) ->
 	{Req#http_req.path_info, Req}.
 
@@ -264,7 +268,7 @@ body_qs(Req) ->
 	-> {ok, #http_req{}}.
 reply(Code, Headers, Body, Req=#http_req{socket=Socket,
 		transport=Transport, connection=Connection,
-		resp_state=waiting}) ->
+		method=Method, resp_state=waiting}) ->
 	Head = response_head(Code, Headers, [
 		{<<"Connection">>, atom_to_connection(Connection)},
 		{<<"Content-Length">>,
@@ -272,13 +276,24 @@ reply(Code, Headers, Body, Req=#http_req{socket=Socket,
 		{<<"Date">>, cowboy_clock:rfc1123()},
 		{<<"Server">>, <<"Cowboy">>}
 	]),
-	Transport:send(Socket, [Head, Body]),
+	case Method of
+		'HEAD' -> Transport:send(Socket, Head);
+		_ -> Transport:send(Socket, [Head, Body])
+	end,
 	{ok, Req#http_req{resp_state=done}}.
 
 %% @doc Initiate the sending of a chunked reply to the client.
 %% @see cowboy_http_req:chunk/2
 -spec chunked_reply(http_status(), http_headers(), #http_req{})
 	-> {ok, #http_req{}}.
+chunked_reply(Code, Headers, Req=#http_req{socket=Socket, transport=Transport,
+		method='HEAD', resp_state=waiting}) ->
+	Head = response_head(Code, Headers, [
+		{<<"Date">>, cowboy_clock:rfc1123()},
+		{<<"Server">>, <<"Cowboy">>}
+	]),
+	Transport:send(Socket, Head),
+	{ok, Req#http_req{resp_state=done}};
 chunked_reply(Code, Headers, Req=#http_req{socket=Socket, transport=Transport,
 		resp_state=waiting}) ->
 	Head = response_head(Code, Headers, [
@@ -294,6 +309,8 @@ chunked_reply(Code, Headers, Req=#http_req{socket=Socket, transport=Transport,
 %%
 %% A chunked reply must have been initiated before calling this function.
 -spec chunk(iodata(), #http_req{}) -> ok.
+chunk(_Data, #http_req{socket=_Socket, transport=_Transport, method='HEAD'}) ->
+	ok;
 chunk(Data, #http_req{socket=Socket, transport=Transport, resp_state=chunks}) ->
 	Transport:send(Socket, [integer_to_list(iolist_size(Data), 16),
 		<<"\r\n">>, Data, <<"\r\n">>]).
@@ -329,7 +346,7 @@ response_head(Code, Headers, DefaultHeaders) ->
 	Headers2 = [{header_to_binary(Key), Value} || {Key, Value} <- Headers],
 	Headers3 = lists:keysort(1, Headers2),
 	Headers4 = lists:ukeymerge(1, Headers3, DefaultHeaders),
-	Headers5 = [<< Key/binary, ": ", Value/binary, "\r\n" >>
+	Headers5 = [[Key, <<": ">>, Value, <<"\r\n">>]
 		|| {Key, Value} <- Headers4],
 	[StatusLine, Headers5, <<"\r\n">>].
 

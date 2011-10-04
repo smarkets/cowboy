@@ -30,6 +30,7 @@
 %% @see cowboy_dispatcher
 %% @see cowboy_http_handler
 -module(cowboy_http_protocol).
+-behaviour(cowboy_protocol).
 
 -export([start_link/4]). %% API.
 -export([init/4, parse_request/1]). %% FSM.
@@ -148,10 +149,12 @@ header({http_header, _I, 'Host', _R, RawHost}, Req=#http_req{
 	case catch cowboy_dispatcher:split_host(RawHost2) of
 		{Host, RawHost3, undefined} ->
 			Port = default_port(Transport:name()),
-			dispatch(Req#http_req{host=Host, raw_host=RawHost3, port=Port,
+			dispatch(fun parse_header/2, Req#http_req{
+				host=Host, raw_host=RawHost3, port=Port,
 				headers=[{'Host', RawHost3}|Req#http_req.headers]}, State);
 		{Host, RawHost3, Port} ->
-			dispatch(Req#http_req{host=Host, raw_host=RawHost3, port=Port,
+			dispatch(fun parse_header/2, Req#http_req{
+				host=Host, raw_host=RawHost3, port=Port,
 				headers=[{'Host', RawHost3}|Req#http_req.headers]}, State);
 		{'EXIT', _Reason} ->
 			error_terminate(400, State)
@@ -168,24 +171,30 @@ header({http_header, _I, Field, _R, Value}, Req, State) ->
 	Field2 = format_header(Field),
 	parse_header(Req#http_req{headers=[{Field2, Value}|Req#http_req.headers]},
 		State);
-%% The Host header is required.
-header(http_eoh, #http_req{host=undefined}, State) ->
+%% The Host header is required in HTTP/1.1.
+header(http_eoh, #http_req{version={1, 1}, host=undefined}, State) ->
 	error_terminate(400, State);
+%% It is however optional in HTTP/1.0.
+header(http_eoh, Req=#http_req{version={1, 0}, transport=Transport,
+		host=undefined}, State=#state{buffer=Buffer}) ->
+	Port = default_port(Transport:name()),
+	dispatch(fun handler_init/2, Req#http_req{host=[], raw_host= <<>>,
+		port=Port, buffer=Buffer}, State#state{buffer= <<>>});
 header(http_eoh, Req, State=#state{buffer=Buffer}) ->
 	handler_init(Req#http_req{buffer=Buffer}, State#state{buffer= <<>>});
 header({http_error, _Bin}, _Req, State) ->
 	error_terminate(500, State).
 
--spec dispatch(#http_req{}, #state{}) -> ok.
-dispatch(Req=#http_req{host=Host, path=Path},
+-spec dispatch(fun((#http_req{}, #state{}) -> ok),
+	#http_req{}, #state{}) -> ok.
+dispatch(Next, Req=#http_req{host=Host, path=Path},
 		State=#state{dispatch=Dispatch}) ->
 	%% @todo We probably want to filter the Host and Path here to allow
 	%%       things like url rewriting.
 	case cowboy_dispatcher:match(Host, Path, Dispatch) of
 		{ok, Handler, Opts, Binds, HostInfo, PathInfo} ->
-			parse_header(Req#http_req{host_info=HostInfo, path_info=PathInfo,
-				bindings=Binds},
-				State#state{handler={Handler, Opts}});
+			Next(Req#http_req{host_info=HostInfo, path_info=PathInfo,
+				bindings=Binds}, State#state{handler={Handler, Opts}});
 		{error, notfound, host} ->
 			error_terminate(400, State);
 		{error, notfound, path} ->
@@ -204,8 +213,10 @@ handler_init(Req, State=#state{listener=ListenerPid,
 	catch Class:Reason ->
 		error_terminate(500, State),
 		error_logger:error_msg(
-			"** Handler ~p terminating in init/3 for the reason ~p:~p~n"
-			"** Options were ~p~n** Request was ~p~n** Stacktrace: ~p~n~n",
+			"** Handler ~p terminating in init/3~n"
+			"   for the reason ~p:~p~n"
+			"** Options were ~p~n"
+			"** Request was ~p~n** Stacktrace: ~p~n~n",
 			[Handler, Class, Reason, Opts, Req, erlang:get_stacktrace()])
 	end.
 
@@ -216,7 +227,8 @@ handler_loop(HandlerState, Req, State=#state{handler={Handler, Opts}}) ->
 			next_request(HandlerState2, Req2, State)
 	catch Class:Reason ->
 		error_logger:error_msg(
-			"** Handler ~p terminating in handle/2 for the reason ~p:~p~n"
+			"** Handler ~p terminating in handle/2~n"
+			"   for the reason ~p:~p~n"
 			"** Options were ~p~n** Handler state was ~p~n"
 			"** Request was ~p~n** Stacktrace: ~p~n~n",
 			[Handler, Class, Reason, Opts,
@@ -231,7 +243,8 @@ handler_terminate(HandlerState, Req, #state{handler={Handler, Opts}}) ->
 		Handler:terminate(Req#http_req{resp_state=locked}, HandlerState)
 	catch Class:Reason ->
 		error_logger:error_msg(
-			"** Handler ~p terminating in terminate/2 for the reason ~p:~p~n"
+			"** Handler ~p terminating in terminate/2~n"
+			"   for the reason ~p:~p~n"
 			"** Options were ~p~n** Handler state was ~p~n"
 			"** Request was ~p~n** Stacktrace: ~p~n~n",
 			[Handler, Class, Reason, Opts,
@@ -246,7 +259,8 @@ next_request(HandlerState, Req=#http_req{buffer=Buffer}, State) ->
 	RespRes = ensure_response(Req, State),
 	case {HandlerRes, BodyRes, RespRes, State#state.connection} of
 		{ok, ok, ok, keepalive} ->
-			?MODULE:parse_request(State#state{buffer=Buffer});
+			?MODULE:parse_request(State#state{
+				buffer=Buffer, req_empty_lines=0});
 		_Closed ->
 			terminate(State)
 	end.
